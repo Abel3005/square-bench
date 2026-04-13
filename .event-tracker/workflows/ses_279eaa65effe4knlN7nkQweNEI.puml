@@ -1,0 +1,18 @@
+@startuml
+title Session Workflow: ses_279e
+
+actor User
+participant Assistant
+
+== Interaction 1 [18:03:59] ==
+note over User, Assistant : created
+
+== Interaction 2 [18:03:59] ==
+User -> Assistant : hello
+activate Assistant
+note right of Assistant : tokens: 9477in/43out $0 (1493.0s)
+Assistant --> User : Hello! How can I help you today?
+deactivate Assistant
+note over User, Assistant : idle
+
+@enduml
