@@ -6,8 +6,9 @@ Harness Engineering has been primary in AI.
 
 So We should test and verify it.
 
+
 ## Platform
-- Next.js
+- FastAPI
 
 
 # References
