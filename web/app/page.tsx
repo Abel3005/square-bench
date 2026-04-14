@@ -2,18 +2,20 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-type Phase = "pending" | "cloning" | "running" | "saving" | "done" | "error";
+const API = process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:8000";
+
+type Phase = "queued" | "cloning" | "running" | "saving" | "done" | "error";
 
 type FileEntry = { path: string; added: number; removed: number };
 
 type TaskState = {
   instanceId: string;
-  repo?: string;
-  baseCommit?: string;
+  repo: string;
+  baseCommit: string;
   log: string[];
   files: FileEntry[];
   phase: Phase;
-  error?: string | null;
+  error: string | null;
 };
 
 type TaskSeed = {
@@ -34,16 +36,17 @@ type Event = {
   error?: string | null;
   returncode?: number;
   tasks?: TaskSeed[];
-  ts?: number;
 };
 
-const PHASE_CLASS: Record<Phase, string> = {
-  pending: "bg-neutral-800 text-neutral-300",
-  cloning: "bg-sky-800/60 text-sky-200",
-  running: "bg-amber-800/60 text-amber-100",
-  saving: "bg-indigo-800/60 text-indigo-100",
-  done: "bg-emerald-800/60 text-emerald-100",
-  error: "bg-rose-900/70 text-rose-100",
+type Tab = "log" | "files" | "diffs";
+
+const PHASE_COLOR: Record<Phase, string> = {
+  queued: "bg-neutral-700 text-neutral-200",
+  cloning: "bg-sky-700 text-sky-50",
+  running: "bg-amber-600 text-amber-50",
+  saving: "bg-indigo-600 text-indigo-50",
+  done: "bg-emerald-600 text-emerald-50",
+  error: "bg-rose-700 text-rose-50",
 };
 
 const DEFAULT_FORM = {
@@ -54,90 +57,87 @@ const DEFAULT_FORM = {
   timeout: 1800,
 };
 
+const ANSI_RE = /\x1b\[[0-9;]*m/g;
+const stripAnsi = (s: string) => s.replace(ANSI_RE, "");
+
+function emptyTask(seed: TaskSeed): TaskState {
+  return {
+    instanceId: seed.instance_id,
+    repo: seed.repo,
+    baseCommit: seed.base_commit,
+    log: [],
+    files: [],
+    phase: "queued",
+    error: null,
+  };
+}
+
 export default function Page() {
   const [form, setForm] = useState(DEFAULT_FORM);
   const [tasks, setTasks] = useState<Record<string, TaskState>>({});
   const [order, setOrder] = useState<string[]>([]);
   const [current, setCurrent] = useState<string | null>(null);
-  const [runStatus, setRunStatus] = useState<string>("idle");
-  const [openFile, setOpenFile] = useState<{
-    instanceId: string;
-    path: string;
-    diff: string;
-    raw: string | null;
-    mode: "diff" | "raw";
-  } | null>(null);
+  const [tab, setTab] = useState<Tab>("log");
+  const [running, setRunning] = useState(false);
+  const [connected, setConnected] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [openDiff, setOpenDiff] = useState<{ path: string; text: string } | null>(null);
+  const [openFile, setOpenFile] = useState<{ path: string; text: string } | null>(null);
   const logRef = useRef<HTMLPreElement>(null);
 
-  const ensureTask = useCallback((id: string) => {
-    setTasks((prev) => {
-      if (prev[id]) return prev;
-      return {
-        ...prev,
-        [id]: {
-          instanceId: id,
-          log: [],
-          files: [],
-          phase: "pending",
-        },
-      };
-    });
-    setOrder((prev) => (prev.includes(id) ? prev : [...prev, id]));
-  }, []);
-
-  const seedTasks = useCallback((seeds: TaskSeed[]) => {
-    setTasks(() => {
-      const next: Record<string, TaskState> = {};
-      for (const s of seeds) {
-        next[s.instance_id] = {
-          instanceId: s.instance_id,
-          repo: s.repo,
-          baseCommit: s.base_commit,
-          log: [`▶ queued · ${s.repo} @ ${s.base_commit}`],
-          files: [],
-          phase: "pending",
-        };
-      }
-      return next;
-    });
-    setOrder(seeds.map((s) => s.instance_id));
-  }, []);
-
   const applyEvent = useCallback((ev: Event) => {
+    if (ev.type === "tasks_created" && ev.tasks) {
+      const seeds = ev.tasks;
+      setTasks(() => {
+        const next: Record<string, TaskState> = {};
+        for (const s of seeds) next[s.instance_id] = emptyTask(s);
+        return next;
+      });
+      setOrder(seeds.map((s) => s.instance_id));
+      setCurrent(seeds[0]?.instance_id ?? null);
+      return;
+    }
+    if (ev.type === "run_start") {
+      setRunning(true);
+      setError(null);
+      return;
+    }
+    if (ev.type === "run_done") {
+      setRunning(false);
+      return;
+    }
+
     const id = ev.instance_id;
     if (!id) return;
+
     setTasks((prev) => {
-      const existing: TaskState = prev[id] ?? {
-        instanceId: id,
-        log: [],
-        files: [],
-        phase: "pending",
-      };
-      const next: TaskState = { ...existing };
+      const existing: TaskState =
+        prev[id] ??
+        emptyTask({ instance_id: id, repo: ev.repo ?? "", base_commit: ev.base_commit ?? "" });
+      const t: TaskState = { ...existing };
+
       switch (ev.type) {
         case "instance_start":
-          next.repo = ev.repo;
-          next.baseCommit = ev.base_commit;
-          next.log = [...next.log, `▶ ${ev.repo ?? ""} @ ${ev.base_commit ?? ""}`];
-          next.phase = "pending";
+          if (ev.repo) t.repo = ev.repo;
+          if (ev.base_commit) t.baseCommit = ev.base_commit;
           break;
         case "clone_start":
-          next.phase = "cloning";
-          next.log = [...next.log, "⇣ cloning..."];
+          t.phase = "cloning";
+          t.log = [...t.log, "⇣ cloning repo..."];
           break;
         case "clone_done":
-          next.log = [...next.log, "✓ cloned"];
+          t.log = [...t.log, "✓ cloned"];
           break;
         case "agent_start":
-          next.phase = "running";
-          next.log = [...next.log, "▶ squarecode running..."];
+          t.phase = "running";
+          t.log = [...t.log, "▶ squarecode running..."];
           break;
         case "agent_stdout":
-          next.log = [...next.log, ev.line ?? ""];
+          t.log = [...t.log, stripAnsi(ev.line ?? "")];
           break;
         case "agent_done":
-          next.log = [...next.log, `✓ agent exited (${ev.returncode ?? 0})`];
-          next.phase = "saving";
+          t.log = [...t.log, `✓ agent exited (rc=${ev.returncode ?? 0})`];
+          t.phase = "saving";
           break;
         case "file_saved": {
           const entry: FileEntry = {
@@ -145,65 +145,56 @@ export default function Page() {
             added: ev.added ?? 0,
             removed: ev.removed ?? 0,
           };
-          next.files = [...next.files, entry];
-          next.log = [
-            ...next.log,
-            `💾 ${entry.path}  +${entry.added} -${entry.removed}`,
-          ];
+          t.files = [...t.files, entry];
+          t.log = [...t.log, `💾 ${entry.path}  +${entry.added} -${entry.removed}`];
           break;
         }
         case "instance_done":
-          next.phase = ev.error ? "error" : "done";
-          next.error = ev.error ?? null;
-          next.log = [
-            ...next.log,
-            ev.error ? `✗ ${ev.error}` : "✓ done",
-          ];
+          t.phase = ev.error ? "error" : "done";
+          t.error = ev.error ?? null;
+          t.log = [...t.log, ev.error ? `✗ ${ev.error}` : "✓ done"];
           break;
       }
-      return { ...prev, [id]: next };
+      return { ...prev, [id]: t };
     });
   }, []);
 
+  // Initial state + live events.
   useEffect(() => {
-    const es = new EventSource("/api/events");
-    es.onmessage = (e) => {
-      let ev: Event;
+    let cancelled = false;
+    (async () => {
       try {
-        ev = JSON.parse(e.data);
+        const r = await fetch(`${API}/api/state`);
+        if (!r.ok) throw new Error(`state http ${r.status}`);
+        const j = await r.json();
+        if (cancelled) return;
+        setRunning(Boolean(j.running));
+        for (const ev of j.events as Event[]) applyEvent(ev);
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : String(e);
+        setError(`backend unreachable: ${msg}`);
+      }
+    })();
+
+    const es = new EventSource(`${API}/api/events`);
+    es.onopen = () => setConnected(true);
+    es.onerror = () => setConnected(false);
+    es.onmessage = (e) => {
+      try {
+        applyEvent(JSON.parse(e.data) as Event);
       } catch {
-        return;
-      }
-      if (ev.type === "run_start") setRunStatus("running");
-      if (ev.type === "run_done") setRunStatus("done");
-      if (ev.type === "tasks_created" && ev.tasks) {
-        seedTasks(ev.tasks);
-        return;
-      }
-      if (ev.instance_id) {
-        ensureTask(ev.instance_id);
-        applyEvent(ev);
+        /* ignore */
       }
     };
-    return () => es.close();
-  }, [ensureTask, applyEvent, seedTasks]);
+    return () => {
+      cancelled = true;
+      es.close();
+    };
+  }, [applyEvent]);
 
   useEffect(() => {
-    if (logRef.current) {
-      logRef.current.scrollTop = logRef.current.scrollHeight;
-    }
-  }, [current, tasks]);
-
-  useEffect(() => {
-    fetch("/api/status")
-      .then((r) => r.json())
-      .then((j) => setRunStatus(j.running ? "running" : "idle"))
-      .catch(() => {});
-  }, []);
-
-  useEffect(() => {
-    if (!current && order.length > 0) setCurrent(order[0]);
-  }, [order, current]);
+    if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
+  }, [current, tasks, tab]);
 
   const currentTask = useMemo(
     () => (current ? tasks[current] : null),
@@ -211,86 +202,101 @@ export default function Page() {
   );
 
   const start = async () => {
-    const r = await fetch("/api/start", {
+    setError(null);
+    const r = await fetch(`${API}/api/start`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(form),
     });
     if (!r.ok) {
-      const j = await r.json().catch(() => ({}));
-      setRunStatus(`error: ${j.detail ?? r.status}`);
+      const body = await r.json().catch(() => ({}));
+      setError(`start failed: ${body.detail ?? r.status}`);
       return;
     }
     setTasks({});
     setOrder([]);
     setCurrent(null);
-    setRunStatus("running");
+    setTab("log");
   };
 
   const stop = async () => {
-    await fetch("/api/stop", { method: "POST" });
-    setRunStatus("stopped");
+    await fetch(`${API}/api/stop`, { method: "POST" });
   };
 
-  const openFilePreview = async (instanceId: string, path: string) => {
+  const openDiffFile = async (instanceId: string, path: string) => {
     const r = await fetch(
-      `/api/tasks/${encodeURIComponent(instanceId)}/diff?path=${encodeURIComponent(path)}`,
+      `${API}/api/tasks/${encodeURIComponent(instanceId)}/diff?path=${encodeURIComponent(path)}`,
     );
-    const diff = await r.text();
-    setOpenFile({ instanceId, path, diff, raw: null, mode: "diff" });
+    const text = r.ok ? await r.text() : `<error: ${r.status}>`;
+    setOpenDiff({ path, text });
+    setOpenFile(null);
   };
 
-  const loadRaw = async () => {
-    if (!openFile) return;
-    if (openFile.raw !== null) {
-      setOpenFile({ ...openFile, mode: "raw" });
-      return;
-    }
+  const openRawFile = async (instanceId: string, path: string) => {
     const r = await fetch(
-      `/api/tasks/${encodeURIComponent(openFile.instanceId)}/file?path=${encodeURIComponent(openFile.path)}`,
+      `${API}/api/tasks/${encodeURIComponent(instanceId)}/file?path=${encodeURIComponent(path)}`,
     );
-    const raw = r.ok ? await r.text() : "<file not available>";
-    setOpenFile({ ...openFile, raw, mode: "raw" });
+    const text = r.ok ? await r.text() : `<error: ${r.status}>`;
+    setOpenFile({ path, text });
+    setOpenDiff(null);
   };
 
   return (
     <main className="flex h-screen flex-col bg-neutral-950 text-neutral-100">
-      <header className="border-b border-neutral-800 p-3">
-        <div className="flex flex-wrap items-center gap-2">
-          <h1 className="mr-4 text-sm font-semibold tracking-wide text-neutral-300">
-            square-bench · live
-          </h1>
-          <Field label="dataset" value={form.dataset} width="w-64"
-            onChange={(v) => setForm({ ...form, dataset: v })} />
-          <Field label="split" value={form.split} width="w-20"
-            onChange={(v) => setForm({ ...form, split: v })} />
-          <Field label="limit" value={String(form.limit)} width="w-16"
-            onChange={(v) => setForm({ ...form, limit: Number(v) || 0 })} />
-          <Field label="agent" value={form.agent} width="w-48"
-            onChange={(v) => setForm({ ...form, agent: v })} />
-          <Field label="timeout" value={String(form.timeout)} width="w-24"
-            onChange={(v) => setForm({ ...form, timeout: Number(v) || 0 })} />
-          <button
-            onClick={start}
-            className="rounded bg-emerald-600 px-3 py-1 text-xs font-semibold hover:bg-emerald-500"
-          >
-            Start
-          </button>
-          <button
-            onClick={stop}
-            className="rounded bg-rose-700 px-3 py-1 text-xs font-semibold hover:bg-rose-600"
-          >
-            Stop
-          </button>
-          <span className="ml-2 text-xs text-neutral-400">status: {runStatus}</span>
+      <header className="flex flex-wrap items-center gap-2 border-b border-neutral-800 px-4 py-3">
+        <h1 className="mr-4 text-sm font-semibold tracking-wide text-neutral-200">
+          square-bench · live
+        </h1>
+        <Field label="dataset" value={form.dataset} width="w-60"
+          onChange={(v) => setForm({ ...form, dataset: v })} />
+        <Field label="split" value={form.split} width="w-20"
+          onChange={(v) => setForm({ ...form, split: v })} />
+        <Field label="limit" value={String(form.limit)} width="w-14"
+          onChange={(v) => setForm({ ...form, limit: Number(v) || 0 })} />
+        <Field label="agent" value={form.agent} width="w-44"
+          onChange={(v) => setForm({ ...form, agent: v })} />
+        <Field label="timeout" value={String(form.timeout)} width="w-20"
+          onChange={(v) => setForm({ ...form, timeout: Number(v) || 0 })} />
+        <button
+          onClick={start}
+          disabled={running}
+          className="rounded bg-emerald-600 px-3 py-1 text-xs font-semibold text-white hover:bg-emerald-500 disabled:opacity-40"
+        >
+          Start
+        </button>
+        <button
+          onClick={stop}
+          disabled={!running}
+          className="rounded bg-rose-700 px-3 py-1 text-xs font-semibold text-white hover:bg-rose-600 disabled:opacity-40"
+        >
+          Stop
+        </button>
+        <div className="ml-auto flex items-center gap-3 text-[11px]">
+          <span className={`rounded px-2 py-0.5 ${connected ? "bg-emerald-700" : "bg-rose-800"}`}>
+            {connected ? "● live" : "○ offline"}
+          </span>
+          <span className="text-neutral-400">
+            {running ? "running" : "idle"}
+          </span>
         </div>
       </header>
 
+      {error && (
+        <div className="border-b border-rose-900 bg-rose-950 px-4 py-2 text-xs text-rose-200">
+          {error}
+        </div>
+      )}
+
       <div className="flex flex-1 overflow-hidden">
-        <aside className="w-72 overflow-y-auto border-r border-neutral-800">
-          <div className="px-3 py-2 text-xs uppercase tracking-wider text-neutral-500">
-            Tasks ({order.length})
+        <aside className="w-72 shrink-0 overflow-y-auto border-r border-neutral-800">
+          <div className="px-3 py-2 text-[10px] uppercase tracking-wider text-neutral-500">
+            Queue ({order.length})
           </div>
+          {order.length === 0 && (
+            <div className="px-3 py-4 text-[11px] text-neutral-500">
+              Press <b className="text-neutral-300">Start</b> to load tasks from the dataset.
+            </div>
+          )}
           {order.map((id) => {
             const t = tasks[id];
             if (!t) return null;
@@ -298,164 +304,140 @@ export default function Page() {
             return (
               <button
                 key={id}
-                onClick={() => setCurrent(id)}
-                className={`block w-full border-l-2 px-3 py-2 text-left text-xs transition ${
+                onClick={() => {
+                  setCurrent(id);
+                  setOpenDiff(null);
+                  setOpenFile(null);
+                }}
+                className={`block w-full border-l-2 px-3 py-2 text-left text-[11px] transition ${
                   active
                     ? "border-emerald-500 bg-neutral-900"
                     : "border-transparent hover:bg-neutral-900"
                 }`}
               >
-                <div className="flex items-center justify-between">
-                  <span className="truncate font-mono">{id}</span>
-                  <span className={`ml-2 rounded px-1.5 py-0.5 text-[10px] ${PHASE_CLASS[t.phase]}`}>
+                <div className="flex items-center justify-between gap-2">
+                  <span className="truncate font-mono text-neutral-200">{id}</span>
+                  <span className={`shrink-0 rounded px-1.5 py-0.5 text-[9px] font-semibold ${PHASE_COLOR[t.phase]}`}>
                     {t.phase}
                   </span>
                 </div>
-                {t.repo && (
-                  <div className="mt-0.5 truncate text-[10px] text-neutral-500">
-                    {t.repo}
+                <div className="mt-0.5 truncate text-[10px] text-neutral-500">
+                  {t.repo}
+                </div>
+                {t.files.length > 0 && (
+                  <div className="mt-0.5 text-[10px] text-neutral-400">
+                    {t.files.length} file{t.files.length > 1 ? "s" : ""} modified
                   </div>
                 )}
               </button>
             );
           })}
-          {order.length === 0 && (
-            <div className="px-3 py-4 text-xs text-neutral-600">
-              No tasks yet. Press Start.
-            </div>
-          )}
         </aside>
 
         <section className="flex flex-1 flex-col overflow-hidden">
-          <div className="flex items-center justify-between border-b border-neutral-800 px-3 py-2">
-            <div className="text-xs text-neutral-400">
-              {currentTask
-                ? `${currentTask.instanceId} · ${currentTask.repo ?? ""}`
-                : "Select a task"}
+          <div className="flex items-center gap-1 border-b border-neutral-800 px-3 py-2">
+            <div className="mr-3 flex-1 text-[11px] text-neutral-400">
+              {currentTask ? (
+                <span>
+                  <span className="font-mono text-neutral-200">{currentTask.instanceId}</span>
+                  <span className="ml-2 text-neutral-500">
+                    {currentTask.repo} @ {currentTask.baseCommit.slice(0, 8)}
+                  </span>
+                </span>
+              ) : (
+                "Select a task from the queue"
+              )}
             </div>
-            {currentTask?.error && (
-              <div className="text-xs text-rose-400">{currentTask.error}</div>
-            )}
+            <TabBtn active={tab === "log"} onClick={() => setTab("log")}>Log</TabBtn>
+            <TabBtn active={tab === "files"} onClick={() => setTab("files")}>
+              Files ({currentTask?.files.length ?? 0})
+            </TabBtn>
+            <TabBtn active={tab === "diffs"} onClick={() => setTab("diffs")}>
+              Diffs ({currentTask?.files.length ?? 0})
+            </TabBtn>
           </div>
-          <pre
-            ref={logRef}
-            className="flex-1 overflow-auto whitespace-pre-wrap px-3 py-2 font-mono text-[11px] leading-relaxed text-neutral-200"
-          >
-            {currentTask ? currentTask.log.join("\n") : ""}
-          </pre>
-        </section>
 
-        <aside className="w-72 overflow-y-auto border-l border-neutral-800">
-          <div className="px-3 py-2 text-xs uppercase tracking-wider text-neutral-500">
-            Files{currentTask ? ` (${currentTask.files.length})` : ""}
-          </div>
-          {currentTask?.files.map((f) => (
-            <button
-              key={f.path}
-              onClick={() => openFilePreview(currentTask.instanceId, f.path)}
-              className="flex w-full items-center justify-between gap-2 px-3 py-1 text-left font-mono text-[11px] text-neutral-300 hover:bg-neutral-900"
-              title={f.path}
-            >
-              <span className="truncate">{f.path}</span>
-              <span className="shrink-0 text-[10px]">
-                <span className="text-emerald-400">+{f.added}</span>
-                <span className="ml-1 text-rose-400">-{f.removed}</span>
-              </span>
-            </button>
-          ))}
-          {currentTask && currentTask.files.length === 0 && (
-            <div className="px-3 py-2 text-[11px] text-neutral-600">
-              No files saved yet.
-            </div>
-          )}
-        </aside>
-      </div>
-
-      {openFile && (
-        <div
-          className="fixed inset-0 z-10 flex items-center justify-center bg-black/70 p-8"
-          onClick={() => setOpenFile(null)}
-        >
-          <div
-            className="flex h-full max-h-[90vh] w-full max-w-5xl flex-col rounded-lg border border-neutral-700 bg-neutral-950"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="flex items-center justify-between border-b border-neutral-800 px-4 py-2">
-              <div className="font-mono text-xs text-neutral-300">{openFile.path}</div>
-              <div className="flex items-center gap-1">
-                <button
-                  onClick={() => setOpenFile({ ...openFile, mode: "diff" })}
-                  className={`rounded px-2 py-1 text-[11px] ${
-                    openFile.mode === "diff"
-                      ? "bg-emerald-600 text-white"
-                      : "bg-neutral-800 text-neutral-300 hover:bg-neutral-700"
-                  }`}
-                >
-                  diff
-                </button>
-                <button
-                  onClick={loadRaw}
-                  className={`rounded px-2 py-1 text-[11px] ${
-                    openFile.mode === "raw"
-                      ? "bg-emerald-600 text-white"
-                      : "bg-neutral-800 text-neutral-300 hover:bg-neutral-700"
-                  }`}
-                >
-                  raw
-                </button>
-                <button
-                  onClick={() => setOpenFile(null)}
-                  className="ml-2 rounded bg-neutral-800 px-2 py-1 text-[11px] hover:bg-neutral-700"
-                >
-                  Close
-                </button>
-              </div>
-            </div>
-            {openFile.mode === "diff" ? (
-              <DiffView text={openFile.diff} />
-            ) : (
-              <pre className="flex-1 overflow-auto whitespace-pre px-4 py-3 font-mono text-[11px] text-neutral-200">
-                {openFile.raw ?? "loading..."}
+          <div className="flex flex-1 overflow-hidden">
+            {tab === "log" && (
+              <pre
+                ref={logRef}
+                className="flex-1 overflow-auto whitespace-pre-wrap px-4 py-3 font-mono text-[11px] leading-relaxed text-neutral-200"
+              >
+                {currentTask ? currentTask.log.join("\n") : ""}
               </pre>
             )}
-          </div>
-        </div>
-      )}
-    </main>
-  );
-}
 
-function DiffView({ text }: { text: string }) {
-  if (!text.trim()) {
-    return (
-      <div className="flex-1 px-4 py-3 text-[11px] text-neutral-500">
-        (no diff — file unchanged)
-      </div>
-    );
-  }
-  const lines = text.split("\n");
-  return (
-    <div className="flex-1 overflow-auto font-mono text-[11px] leading-relaxed">
-      {lines.map((line, i) => {
-        let cls = "text-neutral-300";
-        if (line.startsWith("+++") || line.startsWith("---")) {
-          cls = "text-neutral-500";
-        } else if (line.startsWith("+")) {
-          cls = "bg-emerald-950/60 text-emerald-200";
-        } else if (line.startsWith("-")) {
-          cls = "bg-rose-950/60 text-rose-200";
-        } else if (line.startsWith("@@")) {
-          cls = "bg-sky-950/60 text-sky-300";
-        } else if (line.startsWith("diff ") || line.startsWith("index ")) {
-          cls = "text-neutral-500";
-        }
-        return (
-          <div key={i} className={`whitespace-pre px-4 ${cls}`}>
-            {line || " "}
+            {tab === "files" && currentTask && (
+              <div className="flex flex-1 overflow-hidden">
+                <ul className="w-72 shrink-0 overflow-y-auto border-r border-neutral-800 py-2">
+                  {currentTask.files.length === 0 && (
+                    <li className="px-3 py-2 text-[11px] text-neutral-500">
+                      No files saved yet.
+                    </li>
+                  )}
+                  {currentTask.files.map((f) => (
+                    <li key={f.path}>
+                      <button
+                        onClick={() => openRawFile(currentTask.instanceId, f.path)}
+                        className={`flex w-full items-center justify-between gap-2 px-3 py-1 text-left font-mono text-[11px] hover:bg-neutral-900 ${
+                          openFile?.path === f.path ? "bg-neutral-900 text-emerald-300" : "text-neutral-300"
+                        }`}
+                      >
+                        <span className="truncate">{f.path}</span>
+                        <span className="shrink-0 text-[10px]">
+                          <span className="text-emerald-400">+{f.added}</span>
+                          <span className="ml-1 text-rose-400">-{f.removed}</span>
+                        </span>
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+                <pre className="flex-1 overflow-auto whitespace-pre px-4 py-3 font-mono text-[11px] text-neutral-200">
+                  {openFile ? openFile.text : "Click a file to view its modified contents."}
+                </pre>
+              </div>
+            )}
+
+            {tab === "diffs" && currentTask && (
+              <div className="flex flex-1 overflow-hidden">
+                <ul className="w-72 shrink-0 overflow-y-auto border-r border-neutral-800 py-2">
+                  {currentTask.files.length === 0 && (
+                    <li className="px-3 py-2 text-[11px] text-neutral-500">
+                      No diffs yet.
+                    </li>
+                  )}
+                  {currentTask.files.map((f) => (
+                    <li key={f.path}>
+                      <button
+                        onClick={() => openDiffFile(currentTask.instanceId, f.path)}
+                        className={`flex w-full items-center justify-between gap-2 px-3 py-1 text-left font-mono text-[11px] hover:bg-neutral-900 ${
+                          openDiff?.path === f.path ? "bg-neutral-900 text-emerald-300" : "text-neutral-300"
+                        }`}
+                      >
+                        <span className="truncate">{f.path}</span>
+                        <span className="shrink-0 text-[10px]">
+                          <span className="text-emerald-400">+{f.added}</span>
+                          <span className="ml-1 text-rose-400">-{f.removed}</span>
+                        </span>
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+                <div className="flex-1 overflow-auto">
+                  {openDiff ? (
+                    <DiffView text={openDiff.text} />
+                  ) : (
+                    <div className="px-4 py-3 text-[11px] text-neutral-500">
+                      Click a file to view its diff.
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
           </div>
-        );
-      })}
-    </div>
+        </section>
+      </div>
+    </main>
   );
 }
 
@@ -479,5 +461,56 @@ function Field({
         className={`${width} rounded border border-neutral-700 bg-neutral-900 px-2 py-1 font-mono text-[11px] text-neutral-100 focus:border-emerald-600 focus:outline-none`}
       />
     </label>
+  );
+}
+
+function TabBtn({
+  active,
+  onClick,
+  children,
+}: {
+  active: boolean;
+  onClick: () => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      className={`rounded px-3 py-1 text-[11px] font-medium transition ${
+        active
+          ? "bg-emerald-600 text-white"
+          : "bg-neutral-800 text-neutral-300 hover:bg-neutral-700"
+      }`}
+    >
+      {children}
+    </button>
+  );
+}
+
+function DiffView({ text }: { text: string }) {
+  if (!text.trim()) {
+    return (
+      <div className="px-4 py-3 text-[11px] text-neutral-500">
+        (no diff — file unchanged)
+      </div>
+    );
+  }
+  const lines = text.split("\n");
+  return (
+    <div className="font-mono text-[11px] leading-relaxed">
+      {lines.map((line, i) => {
+        let cls = "text-neutral-300";
+        if (line.startsWith("+++") || line.startsWith("---")) cls = "text-neutral-500";
+        else if (line.startsWith("+")) cls = "bg-emerald-950/60 text-emerald-200";
+        else if (line.startsWith("-")) cls = "bg-rose-950/60 text-rose-200";
+        else if (line.startsWith("@@")) cls = "bg-sky-950/60 text-sky-300";
+        else if (line.startsWith("diff ") || line.startsWith("index ")) cls = "text-neutral-500";
+        return (
+          <div key={i} className={`whitespace-pre px-4 ${cls}`}>
+            {line || " "}
+          </div>
+        );
+      })}
+    </div>
   );
 }

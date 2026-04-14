@@ -19,6 +19,7 @@ WORKSPACE = ROOT / "workspace"
 EVENTS_FILE = WORKSPACE / "events.jsonl"
 TASKS_DIR = WORKSPACE / "tasks"
 PREDICTIONS_FILE = WORKSPACE / "predictions.jsonl"
+RUNNER_LOG = WORKSPACE / "runner.log"
 RUNNER = ROOT / "run_swebench.py"
 
 WORKSPACE.mkdir(exist_ok=True)
@@ -64,6 +65,13 @@ async def start(req: StartRequest):
         raise HTTPException(status_code=409, detail="A run is already in progress")
 
     EVENTS_FILE.write_text("")
+    RUNNER_LOG.write_text("")
+    # Clear the tasks dir so stale outputs from previous runs don't confuse the UI.
+    if TASKS_DIR.exists():
+        for d in TASKS_DIR.iterdir():
+            if d.is_dir():
+                import shutil
+                shutil.rmtree(d, ignore_errors=True)
 
     cmd = [
         sys.executable,
@@ -78,11 +86,12 @@ async def start(req: StartRequest):
         "--tasks-dir", str(TASKS_DIR),
         "--output", str(PREDICTIONS_FILE),
     ]
+    log_fh = open(RUNNER_LOG, "ab", buffering=0)
     proc = subprocess.Popen(
         cmd,
         cwd=ROOT,
         stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
+        stdout=log_fh,
         stderr=subprocess.STDOUT,
         start_new_session=True,
     )
@@ -194,6 +203,34 @@ async def task_diff(instance_id: str, path: str):
     if not full.is_file():
         raise HTTPException(status_code=404, detail="not found")
     return full.read_text()
+
+
+@app.get("/api/log", response_class=PlainTextResponse)
+async def runner_log():
+    if not RUNNER_LOG.exists():
+        return ""
+    data = RUNNER_LOG.read_bytes()
+    if len(data) > 64 * 1024:
+        data = data[-64 * 1024:]
+    return data.decode("utf-8", "replace")
+
+
+@app.get("/api/state")
+async def state_snapshot():
+    events: list[dict] = []
+    if EVENTS_FILE.exists():
+        for line in EVENTS_FILE.read_text().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                events.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return {
+        "running": _is_running(),
+        "events": events,
+    }
 
 
 @app.get("/api/predictions")
