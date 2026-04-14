@@ -24,3 +24,100 @@ body {
   color: var(--foreground);
   font-family: Arial, Helvetica, sans-serif;
 }
+
+/* VS Code-style code view with shiki highlighting + line number gutter. */
+.codeview {
+  background: #1e1e1e;
+  color: #d4d4d4;
+  font-family: "Menlo", "Cascadia Code", "Consolas", ui-monospace, monospace;
+  font-size: 12px;
+  line-height: 18px;
+  overflow: auto;
+  height: 100%;
+}
+.codeview pre {
+  background: #1e1e1e !important;
+  padding: 8px 0 !important;
+  margin: 0 !important;
+  min-width: max-content;
+}
+.codeview pre code {
+  counter-reset: line;
+  display: block;
+}
+.codeview .line {
+  display: block;
+  padding-left: 16px;
+  padding-right: 16px;
+  min-height: 18px;
+}
+.codeview .line::before {
+  counter-increment: line;
+  content: counter(line);
+  display: inline-block;
+  width: 3.5rem;
+  margin-left: -16px;
+  margin-right: 12px;
+  padding-right: 12px;
+  text-align: right;
+  color: #858585;
+  user-select: none;
+  border-right: 1px solid #2b2b2b;
+}
+.codeview .line:hover {
+  background: #2a2d2e;
+}
+
+/* VS Code-style diff view. */
+.diffview {
+  background: #1e1e1e;
+  color: #d4d4d4;
+  font-family: "Menlo", "Cascadia Code", "Consolas", ui-monospace, monospace;
+  font-size: 12px;
+  line-height: 18px;
+  overflow: auto;
+  height: 100%;
+  min-width: max-content;
+}
+.diffview .row {
+  display: flex;
+  white-space: pre;
+}
+.diffview .gutter {
+  width: 3rem;
+  flex-shrink: 0;
+  padding-right: 10px;
+  text-align: right;
+  color: #858585;
+  user-select: none;
+  border-right: 1px solid #2b2b2b;
+}
+.diffview .sign {
+  width: 1.5rem;
+  flex-shrink: 0;
+  padding-left: 8px;
+  color: #858585;
+  user-select: none;
+}
+.diffview .code {
+  flex: 1;
+  padding-right: 16px;
+}
+.diffview .row.add {
+  background: rgba(155, 185, 85, 0.18);
+}
+.diffview .row.add .sign { color: #9bb955; }
+.diffview .row.del {
+  background: rgba(255, 97, 97, 0.18);
+}
+.diffview .row.del .sign { color: #f97583; }
+.diffview .row.hunk {
+  background: #264f78;
+  color: #9cdcfe;
+  padding: 2px 0;
+}
+.diffview .row.hunk .gutter,
+.diffview .row.hunk .sign { color: #9cdcfe; }
+.diffview .row.header {
+  color: #6a9955;
+}
