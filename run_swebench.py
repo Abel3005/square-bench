@@ -116,7 +116,7 @@ def run_squarecode_stream(
     return proc.returncode or 0
 
 
-def save_task_files(workdir: Path, tasks_dir: Path, instance_id: str, sink: EventSink) -> list[str]:
+def save_task_files(workdir: Path, tasks_dir: Path, instance_id: str, sink: EventSink) -> tuple[list[str], str]:
     # Intent-to-add untracked files so `git diff` reports them as additions.
     subprocess.run(
         ["git", "-C", str(workdir), "add", "-N", "--", ".",
@@ -130,10 +130,20 @@ def save_task_files(workdir: Path, tasks_dir: Path, instance_id: str, sink: Even
         text=True,
         check=True,
     )
+    full_patch_proc = subprocess.run(
+        ["git", "-C", str(workdir), "diff", "--",
+         ".", ":(exclude).event-tracker", ":(exclude).event-tracker/**"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    full_patch = full_patch_proc.stdout
 
     out_dir = tasks_dir / instance_id
     files_dir = out_dir / "files"
     diffs_dir = out_dir / "diffs"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "model_patch.diff").write_text(full_patch)
     saved: list[str] = []
 
     for path in listing.stdout.splitlines():
@@ -169,7 +179,7 @@ def save_task_files(workdir: Path, tasks_dir: Path, instance_id: str, sink: Even
             removed=removed,
         )
 
-    return saved
+    return saved, full_patch
 
 
 def main() -> None:
@@ -235,6 +245,7 @@ def main() -> None:
 
                 error: Optional[str] = None
                 saved: list[str] = []
+                model_patch: str = ""
                 cloned = False
 
                 try:
@@ -267,7 +278,9 @@ def main() -> None:
                 finally:
                     if cloned:
                         try:
-                            saved = save_task_files(workdir, args.tasks_dir, instance_id, sink)
+                            saved, model_patch = save_task_files(
+                                workdir, args.tasks_dir, instance_id, sink
+                            )
                         except Exception as e:  # noqa: BLE001
                             sink.emit(
                                 type="agent_stdout",
@@ -280,6 +293,7 @@ def main() -> None:
                 record = {
                     "instance_id": instance_id,
                     "model_name_or_path": args.model_name,
+                    "model_patch": model_patch,
                     "files": saved,
                 }
                 if error:
