@@ -4,3 +4,7 @@ __pycache__/
 .square-bench/
 dist/
 build/
+workspace/
+web/node_modules/
+web/.next/
+nohup.out
