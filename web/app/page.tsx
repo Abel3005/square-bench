@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { CodeView, DiffCodeView } from "./CodeView";
 
 const API = process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:8000";
 
@@ -392,9 +393,15 @@ export default function Page() {
                     </li>
                   ))}
                 </ul>
-                <pre className="flex-1 overflow-auto whitespace-pre px-4 py-3 font-mono text-[11px] text-neutral-200">
-                  {openFile ? openFile.text : "Click a file to view its modified contents."}
-                </pre>
+                <div className="flex-1 overflow-hidden">
+                  {openFile ? (
+                    <CodeView code={openFile.text} path={openFile.path} />
+                  ) : (
+                    <div className="flex h-full items-center justify-center text-[11px] text-neutral-500">
+                      Click a file to view its modified contents.
+                    </div>
+                  )}
+                </div>
               </div>
             )}
 
@@ -423,11 +430,11 @@ export default function Page() {
                     </li>
                   ))}
                 </ul>
-                <div className="flex-1 overflow-auto">
+                <div className="flex-1 overflow-hidden">
                   {openDiff ? (
-                    <DiffView text={openDiff.text} />
+                    <DiffCodeView text={openDiff.text} />
                   ) : (
-                    <div className="px-4 py-3 text-[11px] text-neutral-500">
+                    <div className="flex h-full items-center justify-center text-[11px] text-neutral-500">
                       Click a file to view its diff.
                     </div>
                   )}
@@ -487,30 +494,3 @@ function TabBtn({
   );
 }
 
-function DiffView({ text }: { text: string }) {
-  if (!text.trim()) {
-    return (
-      <div className="px-4 py-3 text-[11px] text-neutral-500">
-        (no diff — file unchanged)
-      </div>
-    );
-  }
-  const lines = text.split("\n");
-  return (
-    <div className="font-mono text-[11px] leading-relaxed">
-      {lines.map((line, i) => {
-        let cls = "text-neutral-300";
-        if (line.startsWith("+++") || line.startsWith("---")) cls = "text-neutral-500";
-        else if (line.startsWith("+")) cls = "bg-emerald-950/60 text-emerald-200";
-        else if (line.startsWith("-")) cls = "bg-rose-950/60 text-rose-200";
-        else if (line.startsWith("@@")) cls = "bg-sky-950/60 text-sky-300";
-        else if (line.startsWith("diff ") || line.startsWith("index ")) cls = "text-neutral-500";
-        return (
-          <div key={i} className={`whitespace-pre px-4 ${cls}`}>
-            {line || " "}
-          </div>
-        );
-      })}
-    </div>
-  );
-}
