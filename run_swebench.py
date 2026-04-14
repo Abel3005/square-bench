@@ -97,36 +97,57 @@ def run_squarecode_stream(
 
 
 def save_task_files(workdir: Path, tasks_dir: Path, instance_id: str, sink: EventSink) -> list[str]:
-    result = subprocess.run(
-        ["git", "-C", str(workdir), "status", "--porcelain", "-uall"],
+    # Intent-to-add untracked files so `git diff` reports them as additions.
+    subprocess.run(
+        ["git", "-C", str(workdir), "add", "-N", "--", ".",
+         ":(exclude).event-tracker", ":(exclude).event-tracker/**"],
+        check=False,
+    )
+    listing = subprocess.run(
+        ["git", "-C", str(workdir), "diff", "--name-only", "--",
+         ".", ":(exclude).event-tracker", ":(exclude).event-tracker/**"],
         capture_output=True,
         text=True,
         check=True,
     )
+
     out_dir = tasks_dir / instance_id
+    files_dir = out_dir / "files"
+    diffs_dir = out_dir / "diffs"
     saved: list[str] = []
 
-    for raw in result.stdout.splitlines():
-        if not raw:
-            continue
-        status = raw[:2]
-        path = raw[3:]
-        if " -> " in path:
-            path = path.split(" -> ", 1)[1]
-        path = path.strip().strip('"')
+    for path in listing.stdout.splitlines():
+        path = path.strip()
         if not path or any(path.startswith(p) for p in EXCLUDE_PREFIXES):
             continue
-        if "D" in status and not (workdir / path).exists():
-            continue
+
+        diff_proc = subprocess.run(
+            ["git", "-C", str(workdir), "diff", "--", path],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        diff_text = diff_proc.stdout
+        diff_path = diffs_dir / (path + ".diff")
+        diff_path.parent.mkdir(parents=True, exist_ok=True)
+        diff_path.write_text(diff_text)
 
         src = workdir / path
-        if not src.is_file():
-            continue
-        dst = out_dir / path
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src, dst)
+        if src.is_file():
+            dst = files_dir / path
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+
         saved.append(path)
-        sink.emit(type="file_saved", instance_id=instance_id, path=path)
+        added = sum(1 for line in diff_text.splitlines() if line.startswith("+") and not line.startswith("+++"))
+        removed = sum(1 for line in diff_text.splitlines() if line.startswith("-") and not line.startswith("---"))
+        sink.emit(
+            type="file_saved",
+            instance_id=instance_id,
+            path=path,
+            added=added,
+            removed=removed,
+        )
 
     return saved
 
@@ -159,6 +180,16 @@ def main() -> None:
         ds = load_dataset(args.dataset, split=args.split)
         if args.limit:
             ds = ds.select(range(min(args.limit, len(ds))))
+
+        task_manifest = [
+            {
+                "instance_id": row["instance_id"],
+                "repo": row["repo"],
+                "base_commit": row["base_commit"],
+            }
+            for row in ds
+        ]
+        sink.emit(type="tasks_created", tasks=task_manifest)
 
         with args.output.open("w") as f:
             for row in ds:
