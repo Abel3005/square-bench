@@ -12,6 +12,7 @@ So We should test and verify it.
 2. Iterate 3- Each element of Datasets 
 3. Clone the repository in project workspace
 4. Agent run with workspace and prompt template and its output stream out event file
+5. Evaluate Outputs with `swebench.harness.run_evaluation`
 
 ## Agents
 

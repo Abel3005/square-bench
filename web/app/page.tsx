@@ -37,9 +37,32 @@ type Event = {
   error?: string | null;
   returncode?: number;
   tasks?: TaskSeed[];
+  run_id?: string;
+  resolved?: boolean;
+  patch_applied?: boolean;
+  patch_is_none?: boolean;
+  summary?: EvalSummary;
+  tests_status?: unknown;
 };
 
-type Tab = "log" | "files" | "diffs";
+type Tab = "log" | "files" | "diffs" | "eval";
+
+type EvalResult = {
+  resolved?: boolean;
+  patchApplied?: boolean;
+  patchIsNone?: boolean;
+  error?: string;
+  tests?: unknown;
+};
+
+type EvalSummary = {
+  total: number;
+  resolved: number;
+  applied: number;
+  empty_patch: number;
+  resolved_rate: number;
+  apply_rate: number;
+};
 
 const PHASE_COLOR: Record<Phase, string> = {
   queued: "bg-neutral-700 text-neutral-200",
@@ -86,6 +109,10 @@ export default function Page() {
   const [openFile, setOpenFile] = useState<{ path: string; text: string } | null>(null);
   const [tree, setTree] = useState<{ paths: string[]; ready: boolean; truncated?: boolean } | null>(null);
   const [treeLoading, setTreeLoading] = useState(false);
+  const [evalRunning, setEvalRunning] = useState(false);
+  const [evalRunId, setEvalRunId] = useState<string | null>(null);
+  const [evalSummary, setEvalSummary] = useState<EvalSummary | null>(null);
+  const [evalResults, setEvalResults] = useState<Record<string, EvalResult>>({});
   const logRef = useRef<HTMLPreElement>(null);
 
   const applyEvent = useCallback((ev: Event) => {
@@ -107,6 +134,32 @@ export default function Page() {
     }
     if (ev.type === "run_done") {
       setRunning(false);
+      return;
+    }
+    if (ev.type === "evaluate_start") {
+      setEvalRunning(true);
+      setEvalRunId(ev.run_id ?? null);
+      setEvalSummary(null);
+      setEvalResults({});
+      return;
+    }
+    if (ev.type === "evaluate_instance") {
+      const id = ev.instance_id;
+      if (!id) return;
+      setEvalResults((prev) => ({
+        ...prev,
+        [id]: {
+          resolved: ev.resolved,
+          patchApplied: ev.patch_applied,
+          patchIsNone: ev.patch_is_none,
+          tests: ev.tests_status,
+        },
+      }));
+      return;
+    }
+    if (ev.type === "evaluate_done") {
+      setEvalRunning(false);
+      if (ev.summary) setEvalSummary(ev.summary);
       return;
     }
 
@@ -177,6 +230,30 @@ export default function Page() {
         const msg = e instanceof Error ? e.message : String(e);
         setError(`backend unreachable: ${msg}`);
       }
+      try {
+        const r = await fetch(`${API}/api/evaluate/status`);
+        if (r.ok) {
+          const j = await r.json();
+          if (cancelled) return;
+          setEvalRunning(Boolean(j.running));
+          setEvalRunId(j.run_id ?? null);
+          if (j.report?.summary) setEvalSummary(j.report.summary);
+          if (j.report?.instances) {
+            const map: Record<string, EvalResult> = {};
+            for (const [iid, r] of Object.entries(j.report.instances as Record<string, Record<string, unknown>>)) {
+              map[iid] = {
+                resolved: Boolean(r.resolved),
+                patchApplied: Boolean(r.patch_successfully_applied),
+                patchIsNone: Boolean(r.patch_is_None),
+                tests: r.tests_status,
+              };
+            }
+            setEvalResults(map);
+          }
+        }
+      } catch {
+        /* evaluate status optional */
+      }
     })();
 
     const es = new EventSource(`${API}/api/events`);
@@ -224,6 +301,25 @@ export default function Page() {
 
   const stop = async () => {
     await fetch(`${API}/api/stop`, { method: "POST" });
+  };
+
+  const startEvaluation = async () => {
+    setError(null);
+    const r = await fetch(`${API}/api/evaluate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    if (!r.ok) {
+      const body = await r.json().catch(() => ({}));
+      setError(`evaluate failed: ${body.detail ?? r.status}`);
+      return;
+    }
+    setTab("eval");
+  };
+
+  const stopEvaluation = async () => {
+    await fetch(`${API}/api/evaluate/stop`, { method: "POST" });
   };
 
   const openDiffFile = async (instanceId: string, path: string) => {
@@ -295,6 +391,22 @@ export default function Page() {
         >
           Stop
         </button>
+        <div className="mx-2 h-5 w-px bg-neutral-700" />
+        <button
+          onClick={startEvaluation}
+          disabled={running || evalRunning}
+          title="Run the SWE-bench harness on predictions.jsonl"
+          className="rounded bg-indigo-600 px-3 py-1 text-xs font-semibold text-white hover:bg-indigo-500 disabled:opacity-40"
+        >
+          Evaluate
+        </button>
+        <button
+          onClick={stopEvaluation}
+          disabled={!evalRunning}
+          className="rounded bg-rose-800 px-3 py-1 text-xs font-semibold text-white hover:bg-rose-700 disabled:opacity-40"
+        >
+          Stop Eval
+        </button>
         <div className="ml-auto flex items-center gap-3 text-[11px]">
           <span className={`rounded px-2 py-0.5 ${connected ? "bg-emerald-700" : "bg-rose-800"}`}>
             {connected ? "● live" : "○ offline"}
@@ -302,6 +414,16 @@ export default function Page() {
           <span className="text-neutral-400">
             {running ? "running" : "idle"}
           </span>
+          {evalRunning && (
+            <span className="rounded bg-indigo-700 px-2 py-0.5 text-indigo-50">
+              evaluating…
+            </span>
+          )}
+          {evalSummary && !evalRunning && (
+            <span className="rounded bg-indigo-900 px-2 py-0.5 text-indigo-200">
+              resolved {evalSummary.resolved}/{evalSummary.total}
+            </span>
+          )}
         </div>
       </header>
 
@@ -353,6 +475,17 @@ export default function Page() {
                     {t.files.length} file{t.files.length > 1 ? "s" : ""} modified
                   </div>
                 )}
+                {evalResults[id] && (
+                  <div className="mt-0.5 text-[10px]">
+                    {evalResults[id].resolved ? (
+                      <span className="text-emerald-400">✓ resolved</span>
+                    ) : evalResults[id].patchApplied ? (
+                      <span className="text-rose-400">✗ unresolved</span>
+                    ) : (
+                      <span className="text-amber-400">⚠ patch failed</span>
+                    )}
+                  </div>
+                )}
               </button>
             );
           })}
@@ -378,6 +511,9 @@ export default function Page() {
             </TabBtn>
             <TabBtn active={tab === "diffs"} onClick={() => setTab("diffs")}>
               Diffs ({currentTask?.files.length ?? 0})
+            </TabBtn>
+            <TabBtn active={tab === "eval"} onClick={() => setTab("eval")}>
+              Eval
             </TabBtn>
           </div>
 
@@ -444,6 +580,106 @@ export default function Page() {
               </div>
             )}
 
+            {tab === "eval" && (
+              <div className="flex flex-1 flex-col overflow-auto p-4">
+                {!evalSummary && !evalRunning && Object.keys(evalResults).length === 0 && (
+                  <div className="text-[11px] text-neutral-500">
+                    No evaluation yet. Press <b className="text-neutral-300">Evaluate</b> to run
+                    the SWE-bench harness on <code>predictions.jsonl</code>. Requires Docker.
+                  </div>
+                )}
+                {(evalSummary || Object.keys(evalResults).length > 0) && (
+                  <>
+                    <div className="mb-4 grid grid-cols-2 gap-3 md:grid-cols-5">
+                      <Metric label="total" value={evalSummary?.total ?? order.length} />
+                      <Metric
+                        label="resolved"
+                        value={`${evalSummary?.resolved ?? Object.values(evalResults).filter((r) => r.resolved).length}`}
+                        tint="emerald"
+                      />
+                      <Metric
+                        label="resolved rate"
+                        value={`${(((evalSummary?.resolved_rate ?? 0) * 100)).toFixed(1)}%`}
+                        tint="emerald"
+                      />
+                      <Metric
+                        label="apply rate"
+                        value={`${(((evalSummary?.apply_rate ?? 0) * 100)).toFixed(1)}%`}
+                        tint="sky"
+                      />
+                      <Metric
+                        label="empty patch"
+                        value={`${evalSummary?.empty_patch ?? 0}`}
+                        tint="amber"
+                      />
+                    </div>
+                    <div className="overflow-hidden rounded border border-neutral-800">
+                      <table className="w-full text-[11px]">
+                        <thead className="bg-neutral-900 text-neutral-400">
+                          <tr>
+                            <th className="px-3 py-1.5 text-left">instance</th>
+                            <th className="px-3 py-1.5 text-left">status</th>
+                            <th className="px-3 py-1.5 text-left">patch applied</th>
+                            <th className="px-3 py-1.5 text-left">FAIL→PASS</th>
+                            <th className="px-3 py-1.5 text-left">PASS→PASS</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {order.map((id) => {
+                            const r = evalResults[id];
+                            const tests = r?.tests as
+                              | {
+                                  FAIL_TO_PASS?: { success?: string[]; failure?: string[] };
+                                  PASS_TO_PASS?: { success?: string[]; failure?: string[] };
+                                }
+                              | undefined;
+                            const f2p = tests?.FAIL_TO_PASS;
+                            const p2p = tests?.PASS_TO_PASS;
+                            return (
+                              <tr key={id} className="border-t border-neutral-800">
+                                <td className="px-3 py-1.5 font-mono text-neutral-200">{id}</td>
+                                <td className="px-3 py-1.5">
+                                  {!r ? (
+                                    <span className="text-neutral-500">
+                                      {evalRunning ? "waiting…" : "not evaluated"}
+                                    </span>
+                                  ) : r.resolved ? (
+                                    <span className="text-emerald-400">✓ resolved</span>
+                                  ) : r.patchApplied ? (
+                                    <span className="text-rose-400">✗ unresolved</span>
+                                  ) : (
+                                    <span className="text-amber-400">⚠ patch failed</span>
+                                  )}
+                                </td>
+                                <td className="px-3 py-1.5">
+                                  {r ? (r.patchApplied ? "✓" : "✗") : "—"}
+                                </td>
+                                <td className="px-3 py-1.5 font-mono text-[10px] text-neutral-400">
+                                  {f2p
+                                    ? `${(f2p.success ?? []).length}/${(f2p.success ?? []).length + (f2p.failure ?? []).length}`
+                                    : "—"}
+                                </td>
+                                <td className="px-3 py-1.5 font-mono text-[10px] text-neutral-400">
+                                  {p2p
+                                    ? `${(p2p.success ?? []).length}/${(p2p.success ?? []).length + (p2p.failure ?? []).length}`
+                                    : "—"}
+                                </td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                    {evalRunId && (
+                      <div className="mt-3 text-[10px] text-neutral-500">
+                        run_id: <code>{evalRunId}</code>
+                      </div>
+                    )}
+                  </>
+                )}
+              </div>
+            )}
+
             {tab === "diffs" && currentTask && (
               <div className="flex flex-1 overflow-hidden">
                 <ul className="w-72 shrink-0 overflow-y-auto border-r border-neutral-800 py-2">
@@ -507,6 +743,33 @@ function Field({
         className={`${width} rounded border border-neutral-700 bg-neutral-900 px-2 py-1 font-mono text-[11px] text-neutral-100 focus:border-emerald-600 focus:outline-none`}
       />
     </label>
+  );
+}
+
+function Metric({
+  label,
+  value,
+  tint,
+}: {
+  label: string;
+  value: string | number;
+  tint?: "emerald" | "sky" | "amber" | "rose";
+}) {
+  const tintCls =
+    tint === "emerald"
+      ? "text-emerald-300"
+      : tint === "sky"
+        ? "text-sky-300"
+        : tint === "amber"
+          ? "text-amber-300"
+          : tint === "rose"
+            ? "text-rose-300"
+            : "text-neutral-100";
+  return (
+    <div className="rounded border border-neutral-800 bg-neutral-900 px-3 py-2">
+      <div className="text-[10px] uppercase tracking-wider text-neutral-500">{label}</div>
+      <div className={`mt-0.5 text-lg font-semibold ${tintCls}`}>{value}</div>
+    </div>
   );
 }
 
