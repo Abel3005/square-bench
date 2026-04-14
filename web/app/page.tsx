@@ -300,7 +300,30 @@ export default function Page() {
   };
 
   const stop = async () => {
-    await fetch(`${API}/api/stop`, { method: "POST" });
+    try {
+      const r = await fetch(`${API}/api/stop`, { method: "POST" });
+      if (!r.ok) {
+        const body = await r.json().catch(() => ({}));
+        setError(`stop failed: ${body.detail ?? r.status}`);
+        return;
+      }
+    } catch (e: unknown) {
+      setError(`stop failed: ${e instanceof Error ? e.message : String(e)}`);
+      return;
+    }
+    // If run_done never arrives (e.g. runner was SIGKILLed before emitting),
+    // reconcile with the backend so the Start button isn't stuck disabled.
+    setTimeout(async () => {
+      try {
+        const r = await fetch(`${API}/api/status`);
+        if (r.ok) {
+          const j = await r.json();
+          setRunning(Boolean(j.running));
+        }
+      } catch {
+        setRunning(false);
+      }
+    }, 2000);
   };
 
   const startEvaluation = async () => {
@@ -319,7 +342,28 @@ export default function Page() {
   };
 
   const stopEvaluation = async () => {
-    await fetch(`${API}/api/evaluate/stop`, { method: "POST" });
+    try {
+      const r = await fetch(`${API}/api/evaluate/stop`, { method: "POST" });
+      if (!r.ok) {
+        const body = await r.json().catch(() => ({}));
+        setError(`stop eval failed: ${body.detail ?? r.status}`);
+        return;
+      }
+    } catch (e: unknown) {
+      setError(`stop eval failed: ${e instanceof Error ? e.message : String(e)}`);
+      return;
+    }
+    setTimeout(async () => {
+      try {
+        const r = await fetch(`${API}/api/evaluate/status`);
+        if (r.ok) {
+          const j = await r.json();
+          setEvalRunning(Boolean(j.running));
+        }
+      } catch {
+        setEvalRunning(false);
+      }
+    }, 2000);
   };
 
   const openDiffFile = async (instanceId: string, path: string) => {
