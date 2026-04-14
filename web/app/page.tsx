@@ -84,6 +84,8 @@ export default function Page() {
   const [error, setError] = useState<string | null>(null);
   const [openDiff, setOpenDiff] = useState<{ path: string; text: string } | null>(null);
   const [openFile, setOpenFile] = useState<{ path: string; text: string } | null>(null);
+  const [tree, setTree] = useState<{ paths: string[]; ready: boolean; truncated?: boolean } | null>(null);
+  const [treeLoading, setTreeLoading] = useState(false);
   const logRef = useRef<HTMLPreElement>(null);
 
   const applyEvent = useCallback((ev: Event) => {
@@ -233,14 +235,35 @@ export default function Page() {
     setOpenFile(null);
   };
 
-  const openRawFile = async (instanceId: string, path: string) => {
+  const openSourceFile = async (instanceId: string, path: string) => {
     const r = await fetch(
-      `${API}/api/tasks/${encodeURIComponent(instanceId)}/file?path=${encodeURIComponent(path)}`,
+      `${API}/api/tasks/${encodeURIComponent(instanceId)}/source?path=${encodeURIComponent(path)}`,
     );
     const text = r.ok ? await r.text() : `<error: ${r.status}>`;
     setOpenFile({ path, text });
     setOpenDiff(null);
   };
+
+  const refreshTree = useCallback(async (instanceId: string) => {
+    setTreeLoading(true);
+    try {
+      const r = await fetch(`${API}/api/tasks/${encodeURIComponent(instanceId)}/tree`);
+      if (!r.ok) {
+        setTree({ paths: [], ready: false });
+        return;
+      }
+      const j = (await r.json()) as { ready: boolean; paths: string[]; truncated?: boolean };
+      setTree(j);
+    } finally {
+      setTreeLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (tab !== "files" || !current) return;
+    setOpenFile(null);
+    refreshTree(current);
+  }, [tab, current, refreshTree]);
 
   return (
     <main className="flex h-screen flex-col bg-neutral-950 text-neutral-100">
@@ -351,7 +374,7 @@ export default function Page() {
             </div>
             <TabBtn active={tab === "log"} onClick={() => setTab("log")}>Log</TabBtn>
             <TabBtn active={tab === "files"} onClick={() => setTab("files")}>
-              Files ({currentTask?.files.length ?? 0})
+              Files
             </TabBtn>
             <TabBtn active={tab === "diffs"} onClick={() => setTab("diffs")}>
               Diffs ({currentTask?.files.length ?? 0})
@@ -370,35 +393,51 @@ export default function Page() {
 
             {tab === "files" && currentTask && (
               <div className="flex flex-1 overflow-hidden">
-                <ul className="w-72 shrink-0 overflow-y-auto border-r border-neutral-800 py-2">
-                  {currentTask.files.length === 0 && (
-                    <li className="px-3 py-2 text-[11px] text-neutral-500">
-                      No files saved yet.
-                    </li>
-                  )}
-                  {currentTask.files.map((f) => (
-                    <li key={f.path}>
-                      <button
-                        onClick={() => openRawFile(currentTask.instanceId, f.path)}
-                        className={`flex w-full items-center justify-between gap-2 px-3 py-1 text-left font-mono text-[11px] hover:bg-neutral-900 ${
-                          openFile?.path === f.path ? "bg-neutral-900 text-emerald-300" : "text-neutral-300"
-                        }`}
-                      >
-                        <span className="truncate">{f.path}</span>
-                        <span className="shrink-0 text-[10px]">
-                          <span className="text-emerald-400">+{f.added}</span>
-                          <span className="ml-1 text-rose-400">-{f.removed}</span>
-                        </span>
-                      </button>
-                    </li>
-                  ))}
-                </ul>
+                <div className="flex w-80 shrink-0 flex-col border-r border-neutral-800">
+                  <div className="flex items-center justify-between border-b border-neutral-800 px-3 py-1 text-[10px] uppercase tracking-wider text-neutral-500">
+                    <span>Explorer</span>
+                    <button
+                      onClick={() => current && refreshTree(current)}
+                      className="rounded bg-neutral-800 px-2 py-0.5 text-[10px] normal-case text-neutral-300 hover:bg-neutral-700"
+                    >
+                      refresh
+                    </button>
+                  </div>
+                  <div className="flex-1 overflow-auto py-1">
+                    {treeLoading && (
+                      <div className="px-3 py-2 text-[11px] text-neutral-500">loading…</div>
+                    )}
+                    {!treeLoading && tree && !tree.ready && (
+                      <div className="px-3 py-2 text-[11px] text-neutral-500">
+                        Clone not ready yet. Waiting for <code>clone_done</code>.
+                      </div>
+                    )}
+                    {!treeLoading && tree && tree.ready && tree.paths.length === 0 && (
+                      <div className="px-3 py-2 text-[11px] text-neutral-500">
+                        Clone is empty.
+                      </div>
+                    )}
+                    {tree && tree.ready && tree.paths.length > 0 && (
+                      <TreeView
+                        paths={tree.paths}
+                        modified={new Set(currentTask.files.map((f) => f.path))}
+                        selected={openFile?.path ?? null}
+                        onOpen={(p) => openSourceFile(currentTask.instanceId, p)}
+                      />
+                    )}
+                    {tree?.truncated && (
+                      <div className="px-3 py-2 text-[10px] text-amber-500">
+                        tree truncated at {tree.paths.length.toLocaleString()} entries
+                      </div>
+                    )}
+                  </div>
+                </div>
                 <div className="flex-1 overflow-hidden">
                   {openFile ? (
                     <CodeView code={openFile.text} path={openFile.path} />
                   ) : (
                     <div className="flex h-full items-center justify-center text-[11px] text-neutral-500">
-                      Click a file to view its modified contents.
+                      Click a file to view its contents.
                     </div>
                   )}
                 </div>
@@ -469,6 +508,116 @@ function Field({
       />
     </label>
   );
+}
+
+type TreeNode = {
+  name: string;
+  path: string;
+  isDir: boolean;
+  children: TreeNode[];
+};
+
+function buildTree(paths: string[]): TreeNode {
+  const root: TreeNode = { name: "", path: "", isDir: true, children: [] };
+  for (const p of paths) {
+    if (!p) continue;
+    const parts = p.split("/");
+    let cur = root;
+    for (let i = 0; i < parts.length; i++) {
+      const name = parts[i];
+      const isLast = i === parts.length - 1;
+      let child = cur.children.find((c) => c.name === name);
+      if (!child) {
+        child = {
+          name,
+          path: parts.slice(0, i + 1).join("/"),
+          isDir: !isLast,
+          children: [],
+        };
+        cur.children.push(child);
+      }
+      cur = child;
+    }
+  }
+  const sortRec = (n: TreeNode) => {
+    n.children.sort((a, b) => {
+      if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
+      return a.name.localeCompare(b.name);
+    });
+    n.children.forEach(sortRec);
+  };
+  sortRec(root);
+  return root;
+}
+
+function TreeView({
+  paths,
+  modified,
+  selected,
+  onOpen,
+}: {
+  paths: string[];
+  modified: Set<string>;
+  selected: string | null;
+  onOpen: (path: string) => void;
+}) {
+  const root = useMemo(() => buildTree(paths), [paths]);
+  const [expanded, setExpanded] = useState<Set<string>>(() => new Set([""]));
+
+  const toggle = (p: string) => {
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(p)) next.delete(p);
+      else next.add(p);
+      return next;
+    });
+  };
+
+  const render = (node: TreeNode, depth: number): React.ReactNode[] => {
+    const rows: React.ReactNode[] = [];
+    for (const child of node.children) {
+      const pad = { paddingLeft: `${depth * 12 + 8}px` };
+      if (child.isDir) {
+        const open = expanded.has(child.path);
+        rows.push(
+          <div
+            key={child.path}
+            onClick={() => toggle(child.path)}
+            style={pad}
+            className="flex cursor-pointer items-center gap-1 py-0.5 font-mono text-[11px] text-neutral-300 hover:bg-neutral-900"
+          >
+            <span className="w-3 text-neutral-500">{open ? "▾" : "▸"}</span>
+            <span className="text-sky-400">📁</span>
+            <span className="truncate">{child.name}</span>
+          </div>,
+        );
+        if (open) rows.push(...render(child, depth + 1));
+      } else {
+        const isMod = modified.has(child.path);
+        const isSel = selected === child.path;
+        rows.push(
+          <div
+            key={child.path}
+            onClick={() => onOpen(child.path)}
+            style={pad}
+            className={`flex cursor-pointer items-center gap-1 py-0.5 font-mono text-[11px] hover:bg-neutral-900 ${
+              isSel ? "bg-neutral-800 text-emerald-300" : "text-neutral-300"
+            }`}
+          >
+            <span className="w-3" />
+            <span className="text-neutral-500">·</span>
+            <span className="truncate">{child.name}</span>
+            {isMod && (
+              <span className="ml-auto pr-2 text-[10px] text-amber-400">M</span>
+            )}
+          </div>,
+        );
+      }
+    }
+    return rows;
+  };
+
+  return <div>{render(root, 0)}</div>;
 }
 
 function TabBtn({

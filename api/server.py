@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -18,9 +19,13 @@ ROOT = Path(__file__).resolve().parent.parent
 WORKSPACE = ROOT / "workspace"
 EVENTS_FILE = WORKSPACE / "events.jsonl"
 TASKS_DIR = WORKSPACE / "tasks"
+CLONES_DIR = WORKSPACE / "clones"
 PREDICTIONS_FILE = WORKSPACE / "predictions.jsonl"
 RUNNER_LOG = WORKSPACE / "runner.log"
 RUNNER = ROOT / "run_swebench.py"
+
+TREE_IGNORE_DIRS = {".git", "__pycache__", ".mypy_cache", ".pytest_cache", ".ruff_cache", "node_modules", ".venv", "venv", ".tox"}
+MAX_TREE_ENTRIES = 20000
 
 WORKSPACE.mkdir(exist_ok=True)
 TASKS_DIR.mkdir(exist_ok=True)
@@ -66,12 +71,13 @@ async def start(req: StartRequest):
 
     EVENTS_FILE.write_text("")
     RUNNER_LOG.write_text("")
-    # Clear the tasks dir so stale outputs from previous runs don't confuse the UI.
-    if TASKS_DIR.exists():
-        for d in TASKS_DIR.iterdir():
-            if d.is_dir():
-                import shutil
-                shutil.rmtree(d, ignore_errors=True)
+    # Clear stale outputs from previous runs so the UI starts fresh.
+    import shutil
+    for parent in (TASKS_DIR, CLONES_DIR):
+        if parent.exists():
+            for d in parent.iterdir():
+                if d.is_dir():
+                    shutil.rmtree(d, ignore_errors=True)
 
     cmd = [
         sys.executable,
@@ -203,6 +209,44 @@ async def task_diff(instance_id: str, path: str):
     if not full.is_file():
         raise HTTPException(status_code=404, detail="not found")
     return full.read_text()
+
+
+@app.get("/api/tasks/{instance_id}/tree")
+async def task_tree(instance_id: str):
+    clone_root = CLONES_DIR / instance_id
+    if not clone_root.exists():
+        return {"ready": False, "paths": []}
+    paths: list[str] = []
+    truncated = False
+    for dirpath, dirnames, filenames in os.walk(clone_root):
+        # Prune ignored dirs in place so os.walk skips them.
+        dirnames[:] = [d for d in dirnames if d not in TREE_IGNORE_DIRS]
+        rel_dir = Path(dirpath).relative_to(clone_root)
+        for name in filenames:
+            rel = (rel_dir / name).as_posix()
+            if rel.startswith("./"):
+                rel = rel[2:]
+            paths.append(rel)
+            if len(paths) >= MAX_TREE_ENTRIES:
+                truncated = True
+                break
+        if truncated:
+            break
+    paths.sort()
+    return {"ready": True, "paths": paths, "truncated": truncated}
+
+
+@app.get("/api/tasks/{instance_id}/source", response_class=PlainTextResponse)
+async def task_source(instance_id: str, path: str):
+    full = _safe_join(CLONES_DIR / instance_id, path)
+    if not full.is_file():
+        raise HTTPException(status_code=404, detail="not found")
+    try:
+        if full.stat().st_size > 2 * 1024 * 1024:
+            return PlainTextResponse("<file too large to display>")
+        return full.read_text()
+    except UnicodeDecodeError:
+        return PlainTextResponse("<binary file>")
 
 
 @app.get("/api/log", response_class=PlainTextResponse)

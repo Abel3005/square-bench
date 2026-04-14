@@ -274,7 +274,8 @@ def main() -> None:
                                 instance_id=instance_id,
                                 line=f"[save_task_files failed: {e}]",
                             )
-                    shutil.rmtree(workdir, ignore_errors=True)
+                    # Clone is kept so the UI can browse the full repo; it is
+                    # wiped at the next /api/start.
 
                 record = {
                     "instance_id": instance_id,
