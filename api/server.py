@@ -7,6 +7,8 @@ import json
 import os
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -22,7 +24,19 @@ TASKS_DIR = WORKSPACE / "tasks"
 CLONES_DIR = WORKSPACE / "clones"
 PREDICTIONS_FILE = WORKSPACE / "predictions.jsonl"
 RUNNER_LOG = WORKSPACE / "runner.log"
+EVAL_ROOT = WORKSPACE / "evaluate"
+EVAL_LOG = WORKSPACE / "evaluate.log"
 RUNNER = ROOT / "run_swebench.py"
+
+_event_lock = threading.Lock()
+
+
+def _emit_event(event: dict) -> None:
+    event.setdefault("ts", time.time())
+    line = json.dumps(event, ensure_ascii=False) + "\n"
+    with _event_lock, EVENTS_FILE.open("a", encoding="utf-8") as fh:
+        fh.write(line)
+        fh.flush()
 
 TREE_IGNORE_DIRS = {".git", "__pycache__", ".mypy_cache", ".pytest_cache", ".ruff_cache", "node_modules", ".venv", "venv", ".tox"}
 MAX_TREE_ENTRIES = 20000
@@ -39,6 +53,7 @@ app.add_middleware(
 )
 
 state: dict[str, Optional[subprocess.Popen]] = {"proc": None}
+eval_state: dict = {"proc": None, "run_id": None, "watcher": None, "report": None}
 
 
 class StartRequest(BaseModel):
@@ -275,6 +290,202 @@ async def state_snapshot():
         "running": _is_running(),
         "events": events,
     }
+
+
+class EvaluateRequest(BaseModel):
+    dataset: str = "SWE-bench/SWE-bench_Lite"
+    split: str = "test"
+    model_name: str = "squarecode"
+    workers: int = 4
+    timeout: int = 1800
+    cache_level: str = "env"
+
+
+def _eval_running() -> bool:
+    p = eval_state["proc"]
+    return p is not None and p.poll() is None
+
+
+def _collect_instance_reports(run_id: str, model_name: str) -> dict[str, dict]:
+    """Scan swebench's log output for per-instance report.json files."""
+    run_dir = EVAL_ROOT / "logs" / "run_evaluation" / run_id / model_name
+    results: dict[str, dict] = {}
+    if not run_dir.exists():
+        return results
+    for inst_dir in run_dir.iterdir():
+        if not inst_dir.is_dir():
+            continue
+        report_path = inst_dir / "report.json"
+        if not report_path.exists():
+            continue
+        try:
+            data = json.loads(report_path.read_text())
+        except Exception:
+            continue
+        if isinstance(data, dict) and inst_dir.name in data:
+            results[inst_dir.name] = data[inst_dir.name]
+        else:
+            results[inst_dir.name] = data
+    return results
+
+
+def _summarize(reports: dict[str, dict]) -> dict:
+    total = len(reports)
+    resolved = sum(1 for r in reports.values() if r.get("resolved"))
+    applied = sum(1 for r in reports.values() if r.get("patch_successfully_applied"))
+    empty = sum(1 for r in reports.values() if r.get("patch_is_None"))
+    return {
+        "total": total,
+        "resolved": resolved,
+        "applied": applied,
+        "empty_patch": empty,
+        "resolved_rate": (resolved / total) if total else 0.0,
+        "apply_rate": (applied / total) if total else 0.0,
+    }
+
+
+def _watch_evaluation(proc: subprocess.Popen, run_id: str, model_name: str) -> None:
+    seen: set[str] = set()
+    run_dir = EVAL_ROOT / "logs" / "run_evaluation" / run_id / model_name
+    while proc.poll() is None:
+        if run_dir.exists():
+            for inst_dir in run_dir.iterdir():
+                if not inst_dir.is_dir() or inst_dir.name in seen:
+                    continue
+                report_path = inst_dir / "report.json"
+                if not report_path.exists():
+                    continue
+                try:
+                    data = json.loads(report_path.read_text())
+                    result = data.get(inst_dir.name, data) if isinstance(data, dict) else {}
+                except Exception as e:
+                    _emit_event({
+                        "type": "evaluate_instance",
+                        "instance_id": inst_dir.name,
+                        "error": f"report parse failed: {e}",
+                    })
+                    seen.add(inst_dir.name)
+                    continue
+                seen.add(inst_dir.name)
+                _emit_event({
+                    "type": "evaluate_instance",
+                    "instance_id": inst_dir.name,
+                    "resolved": bool(result.get("resolved")),
+                    "patch_applied": bool(result.get("patch_successfully_applied")),
+                    "patch_is_none": bool(result.get("patch_is_None")),
+                    "tests_status": result.get("tests_status"),
+                })
+        time.sleep(1.5)
+
+    # Final sweep after exit.
+    reports = _collect_instance_reports(run_id, model_name)
+    for iid, r in reports.items():
+        if iid in seen:
+            continue
+        seen.add(iid)
+        _emit_event({
+            "type": "evaluate_instance",
+            "instance_id": iid,
+            "resolved": bool(r.get("resolved")),
+            "patch_applied": bool(r.get("patch_successfully_applied")),
+            "patch_is_none": bool(r.get("patch_is_None")),
+            "tests_status": r.get("tests_status"),
+        })
+
+    summary = _summarize(reports)
+    eval_state["report"] = {"run_id": run_id, "summary": summary, "instances": reports}
+    _emit_event({
+        "type": "evaluate_done",
+        "run_id": run_id,
+        "returncode": proc.returncode,
+        "summary": summary,
+    })
+
+
+@app.post("/api/evaluate")
+async def evaluate_start(req: EvaluateRequest):
+    if _eval_running():
+        raise HTTPException(status_code=409, detail="Evaluation already running")
+    if not PREDICTIONS_FILE.exists() or PREDICTIONS_FILE.stat().st_size == 0:
+        raise HTTPException(status_code=400, detail="No predictions.jsonl to evaluate")
+
+    run_id = f"sq-{int(time.time())}"
+    EVAL_ROOT.mkdir(parents=True, exist_ok=True)
+    EVAL_LOG.write_text("")
+
+    cmd = [
+        sys.executable, "-m", "swebench.harness.run_evaluation",
+        "-p", str(PREDICTIONS_FILE),
+        "-d", req.dataset,
+        "-s", req.split,
+        "-id", run_id,
+        "--max_workers", str(req.workers),
+        "--timeout", str(req.timeout),
+        "--cache_level", req.cache_level,
+    ]
+    log_fh = open(EVAL_LOG, "ab", buffering=0)
+    proc = subprocess.Popen(
+        cmd,
+        cwd=EVAL_ROOT,
+        stdin=subprocess.DEVNULL,
+        stdout=log_fh,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    eval_state["proc"] = proc
+    eval_state["run_id"] = run_id
+    eval_state["report"] = None
+
+    watcher = threading.Thread(
+        target=_watch_evaluation,
+        args=(proc, run_id, req.model_name),
+        daemon=True,
+    )
+    watcher.start()
+    eval_state["watcher"] = watcher
+
+    _emit_event({
+        "type": "evaluate_start",
+        "run_id": run_id,
+        "dataset": req.dataset,
+        "split": req.split,
+        "model_name": req.model_name,
+    })
+    return {"status": "started", "run_id": run_id, "pid": proc.pid}
+
+
+@app.post("/api/evaluate/stop")
+async def evaluate_stop():
+    p = eval_state["proc"]
+    if not p or p.poll() is not None:
+        return {"status": "not running"}
+    p.terminate()
+    try:
+        p.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        p.kill()
+    return {"status": "stopped"}
+
+
+@app.get("/api/evaluate/status")
+async def evaluate_status():
+    p = eval_state["proc"]
+    return {
+        "running": _eval_running(),
+        "run_id": eval_state.get("run_id"),
+        "returncode": p.returncode if p and p.poll() is not None else None,
+        "report": eval_state.get("report"),
+    }
+
+
+@app.get("/api/evaluate/log", response_class=PlainTextResponse)
+async def evaluate_log():
+    if not EVAL_LOG.exists():
+        return ""
+    data = EVAL_LOG.read_bytes()
+    if len(data) > 128 * 1024:
+        data = data[-128 * 1024:]
+    return data.decode("utf-8", "replace")
 
 
 @app.get("/api/predictions")
