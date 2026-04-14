@@ -62,6 +62,8 @@ class StartRequest(BaseModel):
     limit: int = 3
     agent: str = "deepwork-headless"
     timeout: int = 1800
+    runner: str = "host"  # "host" or "docker"
+    docker_image: str = "square-bench/squarecode:latest"
 
 
 def _is_running() -> bool:
@@ -94,6 +96,9 @@ async def start(req: StartRequest):
                 if d.is_dir():
                     shutil.rmtree(d, ignore_errors=True)
 
+    if req.runner not in ("host", "docker"):
+        raise HTTPException(status_code=400, detail="runner must be 'host' or 'docker'")
+
     cmd = [
         sys.executable,
         "-u",
@@ -106,6 +111,8 @@ async def start(req: StartRequest):
         "--events", str(EVENTS_FILE),
         "--tasks-dir", str(TASKS_DIR),
         "--output", str(PREDICTIONS_FILE),
+        "--runner", req.runner,
+        "--docker-image", req.docker_image,
     ]
     log_fh = open(RUNNER_LOG, "ab", buffering=0)
     proc = subprocess.Popen(
