@@ -84,6 +84,7 @@ async def start(req: StartRequest):
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.STDOUT,
+        start_new_session=True,
     )
     state["proc"] = proc
     return {"status": "started", "pid": proc.pid}

@@ -4,14 +4,22 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 type Phase = "pending" | "cloning" | "running" | "saving" | "done" | "error";
 
+type FileEntry = { path: string; added: number; removed: number };
+
 type TaskState = {
   instanceId: string;
   repo?: string;
   baseCommit?: string;
   log: string[];
-  files: string[];
+  files: FileEntry[];
   phase: Phase;
   error?: string | null;
+};
+
+type TaskSeed = {
+  instance_id: string;
+  repo: string;
+  base_commit: string;
 };
 
 type Event = {
@@ -21,8 +29,11 @@ type Event = {
   repo?: string;
   base_commit?: string;
   path?: string;
+  added?: number;
+  removed?: number;
   error?: string | null;
   returncode?: number;
+  tasks?: TaskSeed[];
   ts?: number;
 };
 
@@ -49,7 +60,13 @@ export default function Page() {
   const [order, setOrder] = useState<string[]>([]);
   const [current, setCurrent] = useState<string | null>(null);
   const [runStatus, setRunStatus] = useState<string>("idle");
-  const [openFile, setOpenFile] = useState<{ path: string; body: string } | null>(null);
+  const [openFile, setOpenFile] = useState<{
+    instanceId: string;
+    path: string;
+    diff: string;
+    raw: string | null;
+    mode: "diff" | "raw";
+  } | null>(null);
   const logRef = useRef<HTMLPreElement>(null);
 
   const ensureTask = useCallback((id: string) => {
@@ -66,6 +83,24 @@ export default function Page() {
       };
     });
     setOrder((prev) => (prev.includes(id) ? prev : [...prev, id]));
+  }, []);
+
+  const seedTasks = useCallback((seeds: TaskSeed[]) => {
+    setTasks(() => {
+      const next: Record<string, TaskState> = {};
+      for (const s of seeds) {
+        next[s.instance_id] = {
+          instanceId: s.instance_id,
+          repo: s.repo,
+          baseCommit: s.base_commit,
+          log: [`▶ queued · ${s.repo} @ ${s.base_commit}`],
+          files: [],
+          phase: "pending",
+        };
+      }
+      return next;
+    });
+    setOrder(seeds.map((s) => s.instance_id));
   }, []);
 
   const applyEvent = useCallback((ev: Event) => {
@@ -104,10 +139,19 @@ export default function Page() {
           next.log = [...next.log, `✓ agent exited (${ev.returncode ?? 0})`];
           next.phase = "saving";
           break;
-        case "file_saved":
-          next.files = [...next.files, ev.path ?? ""];
-          next.log = [...next.log, `💾 ${ev.path ?? ""}`];
+        case "file_saved": {
+          const entry: FileEntry = {
+            path: ev.path ?? "",
+            added: ev.added ?? 0,
+            removed: ev.removed ?? 0,
+          };
+          next.files = [...next.files, entry];
+          next.log = [
+            ...next.log,
+            `💾 ${entry.path}  +${entry.added} -${entry.removed}`,
+          ];
           break;
+        }
         case "instance_done":
           next.phase = ev.error ? "error" : "done";
           next.error = ev.error ?? null;
@@ -132,13 +176,17 @@ export default function Page() {
       }
       if (ev.type === "run_start") setRunStatus("running");
       if (ev.type === "run_done") setRunStatus("done");
+      if (ev.type === "tasks_created" && ev.tasks) {
+        seedTasks(ev.tasks);
+        return;
+      }
       if (ev.instance_id) {
         ensureTask(ev.instance_id);
         applyEvent(ev);
       }
     };
     return () => es.close();
-  }, [ensureTask, applyEvent]);
+  }, [ensureTask, applyEvent, seedTasks]);
 
   useEffect(() => {
     if (logRef.current) {
@@ -186,10 +234,23 @@ export default function Page() {
 
   const openFilePreview = async (instanceId: string, path: string) => {
     const r = await fetch(
-      `/api/tasks/${encodeURIComponent(instanceId)}/file?path=${encodeURIComponent(path)}`,
+      `/api/tasks/${encodeURIComponent(instanceId)}/diff?path=${encodeURIComponent(path)}`,
     );
-    const body = await r.text();
-    setOpenFile({ path, body });
+    const diff = await r.text();
+    setOpenFile({ instanceId, path, diff, raw: null, mode: "diff" });
+  };
+
+  const loadRaw = async () => {
+    if (!openFile) return;
+    if (openFile.raw !== null) {
+      setOpenFile({ ...openFile, mode: "raw" });
+      return;
+    }
+    const r = await fetch(
+      `/api/tasks/${encodeURIComponent(openFile.instanceId)}/file?path=${encodeURIComponent(openFile.path)}`,
+    );
+    const raw = r.ok ? await r.text() : "<file not available>";
+    setOpenFile({ ...openFile, raw, mode: "raw" });
   };
 
   return (
@@ -290,12 +351,16 @@ export default function Page() {
           </div>
           {currentTask?.files.map((f) => (
             <button
-              key={f}
-              onClick={() => openFilePreview(currentTask.instanceId, f)}
-              className="block w-full truncate px-3 py-1 text-left font-mono text-[11px] text-neutral-300 hover:bg-neutral-900"
-              title={f}
+              key={f.path}
+              onClick={() => openFilePreview(currentTask.instanceId, f.path)}
+              className="flex w-full items-center justify-between gap-2 px-3 py-1 text-left font-mono text-[11px] text-neutral-300 hover:bg-neutral-900"
+              title={f.path}
             >
-              {f}
+              <span className="truncate">{f.path}</span>
+              <span className="shrink-0 text-[10px]">
+                <span className="text-emerald-400">+{f.added}</span>
+                <span className="ml-1 text-rose-400">-{f.removed}</span>
+              </span>
             </button>
           ))}
           {currentTask && currentTask.files.length === 0 && (
@@ -317,20 +382,80 @@ export default function Page() {
           >
             <div className="flex items-center justify-between border-b border-neutral-800 px-4 py-2">
               <div className="font-mono text-xs text-neutral-300">{openFile.path}</div>
-              <button
-                onClick={() => setOpenFile(null)}
-                className="rounded bg-neutral-800 px-2 py-1 text-xs hover:bg-neutral-700"
-              >
-                Close
-              </button>
+              <div className="flex items-center gap-1">
+                <button
+                  onClick={() => setOpenFile({ ...openFile, mode: "diff" })}
+                  className={`rounded px-2 py-1 text-[11px] ${
+                    openFile.mode === "diff"
+                      ? "bg-emerald-600 text-white"
+                      : "bg-neutral-800 text-neutral-300 hover:bg-neutral-700"
+                  }`}
+                >
+                  diff
+                </button>
+                <button
+                  onClick={loadRaw}
+                  className={`rounded px-2 py-1 text-[11px] ${
+                    openFile.mode === "raw"
+                      ? "bg-emerald-600 text-white"
+                      : "bg-neutral-800 text-neutral-300 hover:bg-neutral-700"
+                  }`}
+                >
+                  raw
+                </button>
+                <button
+                  onClick={() => setOpenFile(null)}
+                  className="ml-2 rounded bg-neutral-800 px-2 py-1 text-[11px] hover:bg-neutral-700"
+                >
+                  Close
+                </button>
+              </div>
             </div>
-            <pre className="flex-1 overflow-auto whitespace-pre px-4 py-3 font-mono text-[11px] text-neutral-200">
-              {openFile.body}
-            </pre>
+            {openFile.mode === "diff" ? (
+              <DiffView text={openFile.diff} />
+            ) : (
+              <pre className="flex-1 overflow-auto whitespace-pre px-4 py-3 font-mono text-[11px] text-neutral-200">
+                {openFile.raw ?? "loading..."}
+              </pre>
+            )}
           </div>
         </div>
       )}
     </main>
+  );
+}
+
+function DiffView({ text }: { text: string }) {
+  if (!text.trim()) {
+    return (
+      <div className="flex-1 px-4 py-3 text-[11px] text-neutral-500">
+        (no diff — file unchanged)
+      </div>
+    );
+  }
+  const lines = text.split("\n");
+  return (
+    <div className="flex-1 overflow-auto font-mono text-[11px] leading-relaxed">
+      {lines.map((line, i) => {
+        let cls = "text-neutral-300";
+        if (line.startsWith("+++") || line.startsWith("---")) {
+          cls = "text-neutral-500";
+        } else if (line.startsWith("+")) {
+          cls = "bg-emerald-950/60 text-emerald-200";
+        } else if (line.startsWith("-")) {
+          cls = "bg-rose-950/60 text-rose-200";
+        } else if (line.startsWith("@@")) {
+          cls = "bg-sky-950/60 text-sky-300";
+        } else if (line.startsWith("diff ") || line.startsWith("index ")) {
+          cls = "text-neutral-500";
+        }
+        return (
+          <div key={i} className={`whitespace-pre px-4 ${cls}`}>
+            {line || " "}
+          </div>
+        );
+      })}
+    </div>
   );
 }
 

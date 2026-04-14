@@ -3,6 +3,7 @@
 import argparse
 import json
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -24,6 +25,23 @@ When done, exit.
 """
 
 EXCLUDE_PREFIXES = (".event-tracker/", ".event-tracker")
+
+_stop_requested = threading.Event()
+_current_agent: dict[str, Optional[subprocess.Popen]] = {"proc": None}
+
+
+def _install_signal_handlers() -> None:
+    def handler(signum, _frame):
+        _stop_requested.set()
+        proc = _current_agent["proc"]
+        if proc and proc.poll() is None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+
+    signal.signal(signal.SIGTERM, handler)
+    signal.signal(signal.SIGINT, handler)
 
 
 class EventSink:
@@ -74,6 +92,7 @@ def run_squarecode_stream(
         text=True,
         bufsize=1,
     )
+    _current_agent["proc"] = proc
 
     def pump() -> None:
         assert proc.stdout is not None
@@ -93,6 +112,7 @@ def run_squarecode_stream(
         reader.join(timeout=2)
         raise
     reader.join(timeout=5)
+    _current_agent["proc"] = None
     return proc.returncode or 0
 
 
@@ -167,6 +187,7 @@ def main() -> None:
 
     args.tasks_dir.mkdir(parents=True, exist_ok=True)
     sink = EventSink(args.events)
+    _install_signal_handlers()
 
     try:
         sink.emit(
@@ -193,6 +214,9 @@ def main() -> None:
 
         with args.output.open("w") as f:
             for row in ds:
+                if _stop_requested.is_set():
+                    break
+
                 instance_id = row["instance_id"]
                 repo = row["repo"]
                 base_commit = row["base_commit"]
@@ -211,10 +235,12 @@ def main() -> None:
 
                 error: Optional[str] = None
                 saved: list[str] = []
+                cloned = False
 
                 try:
                     sink.emit(type="clone_start", instance_id=instance_id)
                     clone_instance(repo, base_commit, workdir)
+                    cloned = True
                     sink.emit(type="clone_done", instance_id=instance_id)
 
                     prompt = PROMPT_TEMPLATE.format(
@@ -230,8 +256,8 @@ def main() -> None:
                     sink.emit(type="agent_done", instance_id=instance_id, returncode=rc)
                     if rc != 0:
                         error = f"squarecode exited {rc}"
-
-                    saved = save_task_files(workdir, args.tasks_dir, instance_id, sink)
+                    if _stop_requested.is_set():
+                        error = "stopped"
                 except subprocess.TimeoutExpired:
                     error = "timeout"
                 except subprocess.CalledProcessError as e:
@@ -239,6 +265,15 @@ def main() -> None:
                 except Exception as e:  # noqa: BLE001
                     error = f"{type(e).__name__}: {e}"
                 finally:
+                    if cloned:
+                        try:
+                            saved = save_task_files(workdir, args.tasks_dir, instance_id, sink)
+                        except Exception as e:  # noqa: BLE001
+                            sink.emit(
+                                type="agent_stdout",
+                                instance_id=instance_id,
+                                line=f"[save_task_files failed: {e}]",
+                            )
                     shutil.rmtree(workdir, ignore_errors=True)
 
                 record = {
@@ -258,7 +293,10 @@ def main() -> None:
                     files=saved,
                 )
 
-        sink.emit(type="run_done")
+                if _stop_requested.is_set():
+                    break
+
+        sink.emit(type="run_done", stopped=_stop_requested.is_set())
     finally:
         sink.close()
 
