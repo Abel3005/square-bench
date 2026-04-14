@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import os
 import shutil
 import signal
 import subprocess
@@ -28,6 +29,9 @@ EXCLUDE_PREFIXES = (".event-tracker/", ".event-tracker")
 
 _stop_requested = threading.Event()
 _current_agent: dict[str, Optional[subprocess.Popen]] = {"proc": None}
+_current_container: dict[str, Optional[str]] = {"name": None}
+
+DEFAULT_DOCKER_IMAGE = "square-bench/squarecode:latest"
 
 
 def _install_signal_handlers() -> None:
@@ -37,6 +41,13 @@ def _install_signal_handlers() -> None:
         if proc and proc.poll() is None:
             try:
                 proc.terminate()
+            except Exception:
+                pass
+        name = _current_container["name"]
+        if name:
+            try:
+                subprocess.run(["docker", "kill", name], check=False,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             except Exception:
                 pass
 
@@ -113,6 +124,106 @@ def run_squarecode_stream(
         raise
     reader.join(timeout=5)
     _current_agent["proc"] = None
+    return proc.returncode or 0
+
+
+def _docker_config_mounts() -> list[str]:
+    """Read-only mounts for squarecode auth/config from the host user."""
+    home = Path(os.path.expanduser("~"))
+    candidates = [
+        (home / ".local/share/squarecode/auth.json",
+         "/root/.local/share/squarecode/auth.json"),
+        (home / ".config/squarecode/squarecode.json",
+         "/root/.config/squarecode/squarecode.json"),
+        (home / ".local/state/squarecode/model.json",
+         "/root/.local/state/squarecode/model.json"),
+    ]
+    args: list[str] = []
+    for src, dst in candidates:
+        if src.exists():
+            args += ["-v", f"{src}:{dst}:ro"]
+    return args
+
+
+def run_in_container(
+    workdir: Path,
+    repo: str,
+    base_commit: str,
+    prompt: str,
+    agent: Optional[str],
+    timeout: int,
+    instance_id: str,
+    image: str,
+    sink: EventSink,
+) -> int:
+    """Clone + run squarecode entirely inside a container, bind-mounting workdir.
+
+    Files created by the container appear on the host at `workdir`, so the
+    existing save_task_files() pipeline keeps working unchanged.
+    """
+    workdir.mkdir(parents=True, exist_ok=True)
+    prompt_file = workdir.parent / f".prompt-{instance_id}.txt"
+    prompt_file.write_text(prompt)
+
+    container_name = f"sb-{instance_id}-{int(time.time())}"
+    _current_container["name"] = container_name
+
+    agent_flag = f" --agent={agent}" if agent else ""
+    script = (
+        "set -e\n"
+        f'git clone --quiet "https://github.com/{repo}.git" /work\n'
+        f'git -C /work checkout --quiet "{base_commit}"\n'
+        'cd /work\n'
+        f'squarecode run{agent_flag} "$(cat /prompt.txt)"\n'
+    )
+
+    cmd = [
+        "docker", "run", "--rm", "-i",
+        "--name", container_name,
+        "-v", f"{workdir.resolve()}:/work",
+        "-v", f"{prompt_file.resolve()}:/prompt.txt:ro",
+        *_docker_config_mounts(),
+        "-w", "/work",
+        "--entrypoint", "bash",
+        image,
+        "-lc", script,
+    ]
+
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    _current_agent["proc"] = proc
+
+    def pump() -> None:
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            sink.emit(
+                type="agent_stdout",
+                instance_id=instance_id,
+                line=line.rstrip("\n"),
+            )
+
+    reader = threading.Thread(target=pump, daemon=True)
+    reader.start()
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        subprocess.run(["docker", "kill", container_name], check=False,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        proc.kill()
+        reader.join(timeout=2)
+        raise
+    finally:
+        prompt_file.unlink(missing_ok=True)
+        _current_agent["proc"] = None
+        _current_container["name"] = None
+
+    reader.join(timeout=5)
     return proc.returncode or 0
 
 
@@ -193,6 +304,10 @@ def main() -> None:
     parser.add_argument("--tasks-dir", type=Path, default=Path("workspace/tasks"))
     parser.add_argument("--events", type=Path, default=None)
     parser.add_argument("--model-name", default="squarecode")
+    parser.add_argument("--runner", choices=["host", "docker"], default="host",
+                        help="Where to run squarecode: directly on host or inside a container.")
+    parser.add_argument("--docker-image", default=DEFAULT_DOCKER_IMAGE,
+                        help="Image used when --runner=docker.")
     args = parser.parse_args()
 
     args.tasks_dir.mkdir(parents=True, exist_ok=True)
@@ -249,21 +364,33 @@ def main() -> None:
                 cloned = False
 
                 try:
-                    sink.emit(type="clone_start", instance_id=instance_id)
-                    clone_instance(repo, base_commit, workdir)
-                    cloned = True
-                    sink.emit(type="clone_done", instance_id=instance_id)
-
                     prompt = PROMPT_TEMPLATE.format(
                         repo=repo,
                         base_commit=base_commit,
                         problem_statement=row["problem_statement"],
                     )
 
-                    sink.emit(type="agent_start", instance_id=instance_id)
-                    rc = run_squarecode_stream(
-                        workdir, prompt, args.agent, args.timeout, instance_id, sink
-                    )
+                    if args.runner == "docker":
+                        sink.emit(type="clone_start", instance_id=instance_id,
+                                  runner="docker", image=args.docker_image)
+                        sink.emit(type="agent_start", instance_id=instance_id,
+                                  runner="docker")
+                        rc = run_in_container(
+                            workdir, repo, base_commit, prompt, args.agent,
+                            args.timeout, instance_id, args.docker_image, sink,
+                        )
+                        cloned = workdir.exists() and any(workdir.iterdir())
+                        sink.emit(type="clone_done", instance_id=instance_id)
+                    else:
+                        sink.emit(type="clone_start", instance_id=instance_id)
+                        clone_instance(repo, base_commit, workdir)
+                        cloned = True
+                        sink.emit(type="clone_done", instance_id=instance_id)
+
+                        sink.emit(type="agent_start", instance_id=instance_id)
+                        rc = run_squarecode_stream(
+                            workdir, prompt, args.agent, args.timeout, instance_id, sink
+                        )
                     sink.emit(type="agent_done", instance_id=instance_id, returncode=rc)
                     if rc != 0:
                         error = f"squarecode exited {rc}"

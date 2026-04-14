@@ -10,9 +10,10 @@ So We should test and verify it.
 
 1. User input Dataset, Agent, etc.
 2. Iterate 3- Each element of Datasets 
-4. Clone the repository in project workspace
-4. Agent run with workspace and prompt template and its output stream out event file
-5. Evaluate Outputs with `swebench.harness.run_evaluation`
+3. execute Docker container that base dataset image(current swebench-dataset: `swebench/sweb.eval.x86_64.<instance>:latest`) 
+4. Clone the repository in container.
+5. Agent run with workspace and prompt template and its output stream out event file
+6. Evaluate Outputs with `swebench.harness.run_evaluation`
 
 ## Agents
 
