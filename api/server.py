@@ -155,30 +155,44 @@ async def list_tasks():
     return {"tasks": tasks}
 
 
+def _safe_join(base: Path, rel: str) -> Path:
+    base = base.resolve()
+    full = (base / rel).resolve()
+    if full != base and not str(full).startswith(str(base) + "/"):
+        raise HTTPException(status_code=400, detail="invalid path")
+    return full
+
+
 @app.get("/api/tasks/{instance_id}/files")
 async def task_files(instance_id: str):
-    d = TASKS_DIR / instance_id
-    if not d.exists():
+    diffs_root = TASKS_DIR / instance_id / "diffs"
+    if not diffs_root.exists():
         return {"files": []}
     files = []
-    for p in sorted(d.rglob("*")):
+    for p in sorted(diffs_root.rglob("*.diff")):
         if p.is_file():
-            files.append(str(p.relative_to(d)))
+            rel = str(p.relative_to(diffs_root))
+            files.append(rel[:-5])  # strip ".diff"
     return {"files": files}
 
 
 @app.get("/api/tasks/{instance_id}/file", response_class=PlainTextResponse)
 async def task_file(instance_id: str, path: str):
-    base = (TASKS_DIR / instance_id).resolve()
-    full = (base / path).resolve()
-    if not str(full).startswith(str(base) + "/") and full != base:
-        raise HTTPException(status_code=400, detail="invalid path")
+    full = _safe_join(TASKS_DIR / instance_id / "files", path)
     if not full.is_file():
         raise HTTPException(status_code=404, detail="not found")
     try:
         return full.read_text()
     except UnicodeDecodeError:
         return PlainTextResponse("<binary file>")
+
+
+@app.get("/api/tasks/{instance_id}/diff", response_class=PlainTextResponse)
+async def task_diff(instance_id: str, path: str):
+    full = _safe_join(TASKS_DIR / instance_id / "diffs", path + ".diff")
+    if not full.is_file():
+        raise HTTPException(status_code=404, detail="not found")
+    return full.read_text()
 
 
 @app.get("/api/predictions")
