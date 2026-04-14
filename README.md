@@ -10,7 +10,7 @@ So We should test and verify it.
 
 1. User input Dataset, Agent, etc.
 2. Iterate 3- Each element of Datasets 
-3. Clone the repository in project workspace
+4. Clone the repository in project workspace
 4. Agent run with workspace and prompt template and its output stream out event file
 5. Evaluate Outputs with `swebench.harness.run_evaluation`
 
@@ -51,3 +51,8 @@ When done, exit.
 - **Next.js(16.2.3)**: Check dataset and modified file by Agent.
 - **FastAPI**: interact with Next.js server. It makes local cli agent's results connect the webserver.
 - **tailwindCSS(^4)**: CSS style
+
+## Open question
+
+- we open to contribute this code.
+- consider the PLAN.md that has our plan and bugs
